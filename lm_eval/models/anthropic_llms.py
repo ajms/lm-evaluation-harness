@@ -18,12 +18,13 @@ def anthropic_completion(
     max_tokens_to_sample: int,
     temperature: float,
     stop: List[str],
+    message_api: bool,
     **kwargs: Any,
 ) -> str:
     """Wrapper function around the Anthropic completion API client with exponential back-off
     in case of RateLimitError.
 
-    params:
+    Args:
         client: anthropic.Anthropic
             Anthropic API client
         model: str
@@ -36,10 +37,18 @@ def anthropic_completion(
             Sampling temperature
         stop: List[str]
             List of stop sequences
-        kwargs: Any
+        message_api: bool
+            Flag indicating whether to use the message API or completion API
+        **kwargs: Any
             Additional model_args to pass to the API client
-    """
 
+    Returns:
+        str: The generated completion text
+
+    Raises:
+        Exception: If the 'anthropic' package is not installed
+
+    """
     try:
         import anthropic
     except ModuleNotFoundError:
@@ -59,17 +68,33 @@ please install anthropic via `pip install lm-eval[anthropic]` or `pip install -e
         on_exception_callback=_exception_callback,
     )
     def completion():
-        response = client.completions.create(
-            prompt=f"{anthropic.HUMAN_PROMPT} {prompt}{anthropic.AI_PROMPT}",
-            model=model,
-            # NOTE: Claude really likes to do CoT, and overly aggressive stop sequences
-            #       (e.g. gsm8k's ":") may truncate a lot of the input.
-            stop_sequences=[anthropic.HUMAN_PROMPT] + stop,
-            max_tokens_to_sample=max_tokens_to_sample,
-            temperature=temperature,
-            **kwargs,
-        )
-        return response.completion
+        assert isinstance(client, anthropic.Anthropic)
+        if message_api:
+            message = client.messages.create(
+                model=model,
+                max_tokens=max_tokens_to_sample,
+                temperature=temperature,
+                system="",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [{"type": "text", "text": prompt}],
+                    }
+                ],
+            )
+            return message.content[0].text
+        else:
+            response = client.completions.create(
+                prompt=f"{anthropic.HUMAN_PROMPT} {prompt}{anthropic.AI_PROMPT}",
+                model=model,
+                # NOTE: Claude really likes to do CoT, and overly aggressive stop sequences
+                #       (e.g. gsm8k's ":") may truncate a lot of the input.
+                stop_sequences=[anthropic.HUMAN_PROMPT] + stop,
+                max_tokens_to_sample=max_tokens_to_sample,
+                temperature=temperature,
+                **kwargs,
+            )
+            return response.completion
 
     return completion()
 
@@ -177,6 +202,139 @@ please install anthropic via `pip install lm-eval[anthropic]` or `pip install -e
                     max_tokens_to_sample=max_gen_toks,
                     temperature=temperature,  # TODO: implement non-greedy sampling for Anthropic
                     stop=until,  # type: ignore
+                    message_api=False,
+                    **self.kwargs,
+                )
+                res.append(response)
+
+                self.cache_hook.add_partial("generate_until", request, response)
+            except anthropic.APIConnectionError as e:  # type: ignore # noqa: F821
+                eval_logger.critical(f"Server unreachable: {e.__cause__}")
+                break
+            except anthropic.APIStatusError as e:  # type: ignore # noqa: F821
+                eval_logger.critical(f"API error {e.status_code}: {e.message}")
+                break
+
+        return res
+
+    def _model_call(self, inps):
+        # Isn't used because we override _loglikelihood_tokens
+        raise NotImplementedError()
+
+    def _model_generate(self, context, max_length, eos_token_id):
+        # Isn't used because we override generate_until
+        raise NotImplementedError()
+
+    def loglikelihood(self, requests, disable_tqdm: bool = False):
+        raise NotImplementedError("No support for logits.")
+
+    def loglikelihood_rolling(self, requests, disable_tqdm: bool = False):
+        raise NotImplementedError("No support for logits.")
+
+
+@register_model("anthropic-message-api")
+class AnthropicMessageLM(LM):
+    def __init__(
+        self,
+        model: str = "claude-3-haiku-20240307",
+        max_tokens_to_sample: int = 256,
+        temperature: float = 0,
+        **kwargs,
+    ) -> None:
+        """
+        Initialize the Anthropic API wrapper.
+
+        :param model: str
+            Anthropic model e.g. 'claude-instant-v1', 'claude-2'
+        :param max_tokens_to_sample: int
+            Maximum number of tokens to sample from the model
+        :param temperature: float
+            Sampling temperature
+        :param kwargs: Any
+            Additional model_args to pass to the API client
+        """
+        super().__init__()
+
+        try:
+            import anthropic
+        except ModuleNotFoundError:
+            raise Exception(
+                "attempted to use 'anthropic' LM type, but package `anthropic` is not installed. \
+    please install anthropic via `pip install lm-eval[anthropic]` or `pip install -e .[anthropic]`",
+            )
+
+        self.model = model
+        # defaults to os.environ.get("ANTHROPIC_API_KEY")
+        self.client = anthropic.Anthropic()
+        self.temperature = temperature
+        self.max_tokens_to_sample = max_tokens_to_sample
+        self.tokenizer = self.client.get_tokenizer()
+        self.until = ["\n\n"]
+        self.kwargs = kwargs
+
+    @property
+    def eot_token_id(self):
+        # Not sure but anthropic.HUMAN_PROMPT ?
+        raise NotImplementedError("No idea about anthropic tokenization.")
+
+    @property
+    def max_length(self) -> int:
+        return 2048
+
+    @property
+    def max_gen_toks(self) -> int:
+        return self.max_tokens_to_sample
+
+    @property
+    def batch_size(self):
+        # Isn't used because we override _loglikelihood_tokens
+        raise NotImplementedError("No support for logits.")
+
+    @property
+    def device(self):
+        # Isn't used because we override _loglikelihood_tokens
+        raise NotImplementedError("No support for logits.")
+
+    def tok_encode(self, string: str) -> List[int]:
+        return self.tokenizer.encode(string).ids
+
+    def tok_decode(self, tokens: List[int]) -> str:
+        return self.tokenizer.decode(tokens)
+
+    def _loglikelihood_tokens(self, requests, disable_tqdm: bool = False):
+        raise NotImplementedError("No support for logits.")
+
+    def generate_until(self, requests, disable_tqdm: bool = False) -> List[str]:
+        try:
+            import anthropic
+        except ModuleNotFoundError:
+            raise Exception(
+                "attempted to use 'anthropic' LM type, but package `anthropic` is not installed. \
+please install anthropic via `pip install lm-eval[anthropic]` or `pip install -e .[anthropic]`",
+            )
+
+        if not requests:
+            return []
+
+        _requests: List[Tuple[str, dict]] = [req.args for req in requests]
+
+        res = []
+        for request in tqdm(_requests, disable=disable_tqdm):
+            try:
+                inp = request[0]
+                request_args = request[1]
+                # generation_kwargs
+                until = request_args.get("until", self.until)
+                max_gen_toks = request_args.get("max_gen_toks", self.max_length)
+                temperature = request_args.get("temperature", self.temperature)
+                response = anthropic_completion(
+                    client=self.client,
+                    model=self.model,
+                    prompt=inp,
+                    max_tokens_to_sample=max_gen_toks,
+                    temperature=temperature,  # TODO: implement non-greedy sampling for Anthropic
+                    stop=until,  # type: ignore
+                    message_api=True,
                     **self.kwargs,
                 )
                 res.append(response)
